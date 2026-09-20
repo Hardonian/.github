@@ -1,0 +1,86 @@
+# Agent Governance CI — Composite Action
+# Alternative to the reusable workflow: use this as a step in any job.
+#
+# Usage:
+#   - uses: Hardonian/agent-governance/action@main
+#     with:
+#       fail_on_critical: 'true'
+
+name: Agent Governance Scan
+description: Scan PR diffs for secrets, dangerous commands, and policy violations
+
+inputs:
+  fail_on_critical:
+    description: "Fail if CRITICAL issues found"
+    default: "true"
+  fail_on_issues:
+    description: "Fail on any governance issue"
+    default: "false"
+  extra_laws_path:
+    description: "Path to additional laws YAML in calling repo"
+    default: ""
+  protected_paths:
+    description: "Comma-separated extra protected path prefixes"
+    default: ""
+
+outputs:
+  has_issues:
+    description: "Whether any governance issues were found"
+    value: ${{ steps.scan.outputs.has_issues }}
+  has_critical:
+    description: "Whether critical governance issues were found"
+    value: ${{ steps.scan.outputs.has_critical }}
+  total_issues:
+    description: "Total number of governance issues"
+    value: ${{ steps.scan.outputs.total_issues }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.11"
+
+    - name: Install dependencies
+      shell: bash
+      run: pip install pydantic>=2.0 pyyaml>=6.0
+
+    - name: Fetch governance gateway
+      shell: bash
+      run: |
+        if [ ! -d ".agent-governance" ]; then
+          git clone --depth 1 https://github.com/Hardonian/agent-governance.git .agent-governance
+        fi
+        cp .agent-governance/scripts/governance_check.py ./governance_check.py
+        cp -r .agent-governance/gateway ./gateway
+
+    - name: Run governance scan
+      id: scan
+      shell: bash
+      env:
+        GITHUB_BASE_REF: ${{ github.event.pull_request.base.sha }}
+        GITHUB_HEAD_REF: ${{ github.event.pull_request.head.sha }}
+        PR_NUMBER: ${{ github.event.pull_request.number }}
+        GITHUB_REPOSITORY: ${{ github.repository }}
+        OUTPUT_FILE: governance-report.md
+        FAIL_ON_CRITICAL: ${{ inputs.fail_on_critical }}
+        FAIL_ON_ISSUES: ${{ inputs.fail_on_issues }}
+      run: |
+        python governance_check.py || exit_code=$?
+
+        if [ -f governance-report.json ]; then
+          echo "has_issues=$(python -c "import json; print(json.load(open('governance-report.json'))['total_issues'] > 0)")" >> "$GITHUB_OUTPUT"
+          echo "has_critical=$(python -c "import json; print(json.load(open('governance-report.json'))['has_critical'])")" >> "$GITHUB_OUTPUT"
+          echo "total_issues=$(python -c "import json; print(json.load(open('governance-report.json'))['total_issues'])")" >> "$GITHUB_OUTPUT"
+        fi
+
+        exit ${exit_code:-0}
+
+    - name: Upload report
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: governance-report
+        path: governance-report.*
+        retention-days: 30

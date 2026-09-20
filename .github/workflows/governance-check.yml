@@ -1,0 +1,144 @@
+# Agent Governance CI — Reusable Workflow
+# Scans PR diffs for secrets, dangerous commands, protected path changes,
+# and policy violations using the Hardonian Agent Governance Gateway.
+#
+# Usage: Call from any repo's PR workflow via:
+#   uses: Hardonian/agent-governance/.github/workflows/governance-check.yml@main
+
+name: Agent Governance Check
+
+on:
+  workflow_call:
+    inputs:
+      fail_on_critical:
+        description: "Fail the check if CRITICAL issues are found"
+        type: boolean
+        default: true
+      fail_on_issues:
+        description: "Fail the check on ANY governance issue (not just critical)"
+        type: boolean
+        default: false
+      extra_laws_path:
+        description: "Path to additional laws YAML file in the calling repo (optional)"
+        type: string
+        default: ""
+      protected_paths:
+        description: "Comma-separated extra protected path prefixes (optional)"
+        type: string
+        default: ""
+      python_version:
+        description: "Python version to use"
+        type: string
+        default: "3.11"
+      governance_ref:
+        description: "Git ref of agent-governance repo to use"
+        type: string
+        default: "main"
+    outputs:
+      has_issues:
+        description: "Whether any governance issues were found"
+        type: string
+      has_critical:
+        description: "Whether critical governance issues were found"
+        type: string
+      total_issues:
+        description: "Total number of governance issues"
+        type: string
+      max_risk:
+        description: "Maximum risk level detected (1-5)"
+        type: string
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  governance-check:
+    name: 🛡️ Governance Scan
+    runs-on: ubuntu-latest
+    outputs:
+      has_issues: ${{ steps.scan.outputs.has_issues }}
+      has_critical: ${{ steps.scan.outputs.has_critical }}
+      total_issues: ${{ steps.scan.outputs.total_issues }}
+      max_risk: ${{ steps.scan.outputs.max_risk }}
+
+    steps:
+      - name: Checkout PR repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - name: Checkout Agent Governance Gateway
+        uses: actions/checkout@v4
+        with:
+          repository: Hardonian/agent-governance
+          ref: ${{ inputs.governance_ref }}
+          path: .agent-governance
+
+      - name: Set up Python ${{ inputs.python_version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python_version }}
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pydantic>=2.0 pyyaml>=6.0
+
+      - name: Run governance scan
+        id: scan
+        env:
+          GITHUB_BASE_REF: ${{ github.event.pull_request.base.sha }}
+          GITHUB_HEAD_REF: ${{ github.event.pull_request.head.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          OUTPUT_FILE: governance-report.md
+          FAIL_ON_CRITICAL: ${{ inputs.fail_on_critical }}
+          FAIL_ON_ISSUES: ${{ inputs.fail_on_issues }}
+        run: |
+          # Copy the check script
+          cp .agent-governance/scripts/governance_check.py ./governance_check.py
+
+          # Copy gateway code so the script can import it
+          cp -r .agent-governance/gateway ./gateway
+
+          # If extra laws provided, set env var
+          if [ -n "${{ inputs.extra_laws_path }}" ] && [ -f "${{ inputs.extra_laws_path }}" ]; then
+            export EXTRA_LAWS_PATH="${{ inputs.extra_laws_path }}"
+          fi
+
+          # If extra protected paths provided, write them
+          if [ -n "${{ inputs.protected_paths }}" ]; then
+            export EXTRA_PROTECTED_PATHS="${{ inputs.protected_paths }}"
+          fi
+
+          # Run the scan
+          python governance_check.py || exit_code=$?
+
+          # Capture outputs even on failure
+          if [ -f governance-report.json ]; then
+            echo "has_issues=$(python -c "import json; print(json.load(open('governance-report.json'))['total_issues'] > 0)")" >> "$GITHUB_OUTPUT"
+            echo "has_critical=$(python -c "import json; print(json.load(open('governance-report.json'))['has_critical'])")" >> "$GITHUB_OUTPUT"
+            echo "total_issues=$(python -c "import json; print(json.load(open('governance-report.json'))['total_issues'])")" >> "$GITHUB_OUTPUT"
+            echo "max_risk=$(python -c "import json; print(json.load(open('governance-report.json'))['max_risk'])")" >> "$GITHUB_OUTPUT"
+          fi
+
+          exit ${exit_code:-0}
+
+      - name: Post PR comment
+        if: always() && github.event_name == 'pull_request'
+        uses: marocchino/sticky-pull-request-comment@v2
+        with:
+          header: governance-check
+          path: governance-report.md
+
+      - name: Upload report artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: governance-report
+          path: |
+            governance-report.md
+            governance-report.json
+          retention-days: 30
